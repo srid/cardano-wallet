@@ -42,7 +42,7 @@ RUN test -n "${USE_IOHK_CACHE}" && ( echo "Note: using IOHK nix cache" > /dev/st
 
 # Make a docker layer with a warm cache (helps re-use compilers for
 # subsequent builds).
-RUN nix-build https://github.com/input-output-hk/cardano-wallet/archive/master.tar.gz -A cardano-wallet --no-out-link
+RUN nix-build https://github.com/input-output-hk/cardano-wallet/archive/master.tar.gz -A hydraJobs.linux.musl.cardano-wallet --no-out-link
 
 
 ############################################################################
@@ -61,7 +61,7 @@ WORKDIR cardano-wallet
 # Build
 
 # Build the wallet and node static binaries package, untar to "out" directory
-RUN tar -xzvf $(nix-build release.nix -A cardano-wallet-linux64 --no-out-link)/*.tar.gz
+RUN tar -xzvf $(nix-build release.nix -A hydraJobs.linux.musl.cardano-wallet-linux64 --no-out-link)/*.tar.gz
 RUN mv cardano-wallet-* ../out
 
 # TODO: Alternatively, we could build the dockerImage.shelley

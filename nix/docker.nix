@@ -3,7 +3,7 @@
 #
 # To test it out, use:
 #
-#   docker load -i $(nix-build -A dockerImage --no-out-link)
+#   docker load -i $(nix-build -A hydraJobs.linux.musl.dockerImage --no-out-link)
 #   docker run cardano-wallet
 #
 ############################################################################
