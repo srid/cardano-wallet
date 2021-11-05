@@ -46,3 +46,6 @@ hie.yaml
 
 ### Docs build
 /_build/
+
+### databases of scripts
+/db-cardano-wallet-*
