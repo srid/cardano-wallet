@@ -34,6 +34,8 @@ module Cardano.Wallet.Shelley.Transaction
     , noTxUpdate
     , updateSealedTx
 
+    , inputUTxO
+
     -- * Internals
     , TxPayload (..)
     , TxSkeleton (..)
@@ -225,6 +227,8 @@ import qualified Cardano.Ledger.Alonzo.TxWitness as Alonzo
 import qualified Cardano.Ledger.Coin as Ledger
 import qualified Cardano.Ledger.Core as Ledger
 import qualified Cardano.Ledger.ShelleyMA.TxBody as ShelleyMA
+import Cardano.Wallet
+    ( PartialTx (PartialTx) )
 import qualified Cardano.Wallet.Primitive.Types.Coin as Coin
 import qualified Cardano.Wallet.Primitive.Types.TokenBundle as TokenBundle
 import qualified Cardano.Wallet.Primitive.Types.TokenMap as TokenMap
@@ -1806,3 +1810,11 @@ explicitFees era = case era of
     ShelleyBasedEraAllegra -> Cardano.TxFeeExplicit Cardano.TxFeesExplicitInAllegraEra
     ShelleyBasedEraMary    -> Cardano.TxFeeExplicit Cardano.TxFeesExplicitInMaryEra
     ShelleyBasedEraAlonzo -> Cardano.TxFeeExplicit Cardano.TxFeesExplicitInAlonzoEra
+
+-- TODO: Better name?
+inputUTxO :: PartialTx -> Cardano.UTxO Cardano.AlonzoEra
+inputUTxO (PartialTx _ resolvedInputs _) = Cardano.UTxO $ Map.fromList $ map convertUTxO resolvedInputs
+  where
+    convertUTxO (i, o, Nothing) = (toCardanoTxIn i, toCardanoTxOut Cardano.ShelleyBasedEraAlonzo o)
+    convertUTxO (_, _, Just _) = error "inputUTxO: todo - handle datum hash"
+
