@@ -1,5 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -9,6 +11,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
@@ -21,6 +24,7 @@
 
 module Cardano.Wallet.Shelley.TransactionSpec
     ( spec
+    , balanceTransactionSpec
     ) where
 
 import Prelude
@@ -42,20 +46,29 @@ import Cardano.Api
     , IsCardanoEra (..)
     , IsShelleyBasedEra (..)
     , ShelleyBasedEra (..)
+    , TxOutValue (TxOutAdaOnly, TxOutValue)
     , cardanoEraStyle
     )
 import Cardano.Wallet
-    ( ErrSelectAssets (..)
+    ( BalanceTxNotSupportedReason (..)
+    , ErrBalanceTx (..)
+    , ErrSelectAssets (..)
     , ErrUpdateSealedTx (..)
     , FeeEstimation (..)
+    , PartialTx (PartialTx, sealedTx)
+    , WalletWorkerLog
+    , balanceTransaction
     , estimateFee
     )
 import Cardano.Wallet.Byron.Compatibility
     ( maryTokenBundleMaxSize )
 import Cardano.Wallet.Gen
-    ( genScript )
+    ( genMnemonic, genScript )
 import Cardano.Wallet.Primitive.AddressDerivation
-    ( DerivationIndex (..)
+    ( DelegationAddress (delegationAddress)
+    , Depth (RootK)
+    , DerivationIndex (..)
+    , NetworkDiscriminant (..)
     , Passphrase (..)
     , PassphraseMaxLength (..)
     , PassphraseMinLength (..)
@@ -68,18 +81,31 @@ import Cardano.Wallet.Primitive.AddressDerivation.Byron
 import Cardano.Wallet.Primitive.AddressDerivation.Icarus
     ( IcarusKey )
 import Cardano.Wallet.Primitive.AddressDerivation.Shelley
-    ( ShelleyKey )
+    ( ShelleyKey, generateKeyFromSeed )
 import Cardano.Wallet.Primitive.CoinSelection
     ( SelectionError (..), SelectionOf (..), selectionDelta )
 import Cardano.Wallet.Primitive.CoinSelection.Balance
-    ( UnableToConstructChangeError (..), emptySkeleton )
+    ( SelectionError (EmptyUTxO, SelectionLimitReached)
+    , UnableToConstructChangeError (..)
+    , emptySkeleton
+    )
 import Cardano.Wallet.Primitive.Types
-    ( ExecutionUnitPrices (..)
+    ( ActiveSlotCoefficient (ActiveSlotCoefficient)
+    , Block (..)
+    , BlockHeader (..)
+    , EpochLength (EpochLength)
+    , ExecutionUnitPrices (..)
     , ExecutionUnits (..)
     , FeePolicy (..)
+    , GenesisParameters (..)
+    , MinimumUTxOValue (..)
     , ProtocolParameters (..)
+    , SlotLength (SlotLength)
+    , SlottingParameters (..)
+    , StartTime (StartTime)
     , TokenBundleMaxSize (..)
     , TxParameters (..)
+    , getGenesisBlockDate
     )
 import Cardano.Wallet.Primitive.Types.Address
     ( Address (..) )
@@ -88,7 +114,7 @@ import Cardano.Wallet.Primitive.Types.Coin
 import Cardano.Wallet.Primitive.Types.Coin.Gen
     ( genCoinPositive, shrinkCoinPositive )
 import Cardano.Wallet.Primitive.Types.Hash
-    ( Hash (..) )
+    ( Hash (..), mockHash )
 import Cardano.Wallet.Primitive.Types.RewardAccount
     ( RewardAccount (..) )
 import Cardano.Wallet.Primitive.Types.TokenBundle
@@ -101,6 +127,7 @@ import Cardano.Wallet.Primitive.Types.TokenPolicy.Gen
     ( genTokenPolicyId, shrinkTokenPolicyId )
 import Cardano.Wallet.Primitive.Types.Tx
     ( SealedTx (..)
+    , Tx
     , TxConstraints (..)
     , TxIn (..)
     , TxMetadata (..)
@@ -110,6 +137,7 @@ import Cardano.Wallet.Primitive.Types.Tx
     , cardanoTx
     , sealedTxFromBytes
     , sealedTxFromBytes'
+    , sealedTxFromCardano
     , sealedTxFromCardano'
     , serialisedTx
     , txMetadataIsNull
@@ -122,9 +150,13 @@ import Cardano.Wallet.Primitive.Types.UTxO
 import Cardano.Wallet.Shelley.Compatibility
     ( AnyShelleyBasedEra (..)
     , computeTokenBundleSerializedLengthBytes
+    , fromCardanoTxIn
+    , fromCardanoValue
     , getShelleyBasedEra
     , shelleyToCardanoEra
     , toCardanoLovelace
+    , toCardanoTxIn
+    , toCardanoTxOut
     )
 import Cardano.Wallet.Shelley.Transaction
     ( TxSkeleton (..)
@@ -153,7 +185,7 @@ import Cardano.Wallet.Transaction
 import Cardano.Wallet.Unsafe
     ( unsafeFromHex )
 import Control.Monad
-    ( forM_, replicateM )
+    ( forM, forM_, replicateM )
 import Control.Monad.Trans.Except
     ( except, runExceptT )
 import Data.ByteString
@@ -181,14 +213,13 @@ import Data.Typeable
 import Data.Word
     ( Word16, Word64, Word8 )
 import Fmt
-    ( (+||), (||+) )
+    ( Buildable (..), fmt, nameF, pretty, (+||), (||+) )
 import Ouroboros.Network.Block
     ( SlotNo (..) )
 import System.Directory
     ( listDirectory )
 import System.FilePath
     ( (</>) )
-
 import Test.Hspec
     ( Spec
     , SpecWith
@@ -219,15 +250,18 @@ import Test.QuickCheck
     , counterexample
     , cover
     , elements
+    , forAllShow
     , frequency
     , oneof
     , property
     , scale
+    , shrinkList
     , suchThatMap
     , vector
     , vectorOf
     , withMaxSuccess
     , within
+    , (.&&.)
     , (.||.)
     , (=/=)
     , (===)
@@ -238,28 +272,68 @@ import Test.QuickCheck.Extra
 import Test.QuickCheck.Gen
     ( Gen (..), listOf1 )
 import Test.QuickCheck.Random
-    ( mkQCGen )
+    ( QCGen, mkQCGen )
 import Test.Utils.Paths
     ( getTestData )
+import Test.Utils.Pretty
+    ( Pretty )
 import Test.Utils.Pretty
     ( Pretty (..), (====) )
 
 import qualified Cardano.Api as Cardano
+import Cardano.Api.Gen
+    ( genTxForBalancing, genValueForTxOut )
+import Cardano.Api.Shelley
+    ( selectLovelace )
 import qualified Cardano.Api.Shelley as Cardano
+import Cardano.BM.Data.Tracer
+    ( nullTracer )
+import Cardano.BM.Tracer
+    ( Tracer )
+import qualified Cardano.Ledger.Alonzo.Tx as Alonzo
 import qualified Cardano.Ledger.Alonzo.TxWitness as Alonzo
+import qualified Cardano.Ledger.Coin as Ledger
+import qualified Cardano.Ledger.Core as Ledger
+import Cardano.Mnemonic
+    ( SomeMnemonic (SomeMnemonic) )
+import Cardano.Wallet.Primitive.AddressDiscovery.Sequential
+    ( SeqState, defaultAddressPoolGap, mkSeqStateFromRootXPrv, purposeCIP1852 )
 import qualified Cardano.Wallet.Primitive.CoinSelection.Balance as Balance
+import Cardano.Wallet.Primitive.Model
+    ( Wallet (..), unsafeInitWallet )
+import Cardano.Wallet.Primitive.Slotting
+    ( TimeInterpreter, hoistTimeInterpreter, mkSingleEraInterpreter )
 import qualified Cardano.Wallet.Primitive.Types.Coin as Coin
 import qualified Cardano.Wallet.Primitive.Types.TokenBundle as TokenBundle
 import qualified Cardano.Wallet.Primitive.Types.TokenMap as TokenMap
+import qualified Cardano.Wallet.Primitive.Types.UTxO as UTxO
+import Cardano.Wallet.Primitive.Types.UTxOIndex
+    ( UTxOIndex )
+import qualified Cardano.Wallet.Primitive.Types.UTxOIndex as UTxOIndex
+import Cardano.Wallet.Primitive.Types.UTxOIndex.Gen
+    ( genUTxOIndex )
+import Control.Monad.Random
+    ( MonadRandom (..), Random (randomR, randomRs), random, randoms )
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Foldable as F
+import Data.Functor.Identity
+    ( runIdentity )
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
+import qualified Data.Sequence.Strict as StrictSeq
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import Data.Time.Clock.POSIX
+    ( posixSecondsToUTCTime )
+import GHC.Generics
+    ( Generic )
+import Shelley.Spec.Ledger.API
+    ( StrictMaybe (SJust, SNothing), Wdrl (..) )
+import Test.QuickCheck.Property
+    ( label )
 
 spec :: Spec
 spec = do
@@ -270,6 +344,7 @@ spec = do
     forAllEras binaryCalculationsSpec
     transactionConstraintsSpec
     updateSealedTxSpec
+    balanceTransactionSpec
 
 forAllEras :: (AnyCardanoEra -> Spec) -> Spec
 forAllEras eraSpec = do
@@ -335,11 +410,11 @@ decodeSealedTxSpec = describe "SealedTx serialisation/deserialisation" $ do
 estimateMaxInputsSpec :: Spec
 estimateMaxInputsSpec = do
     estimateMaxInputsTests @ShelleyKey
-        [(1,115),(5,109),(10,104),(20,93),(50,54)]
+        [(1,115),(5,107),(10,100),(20,83),(50,35)]
     estimateMaxInputsTests @ByronKey
-        [(1,73),(5,69),(10,65),(20,57),(50,29)]
+        [(1,73),(5,68),(10,62),(20,50),(50,16)]
     estimateMaxInputsTests @IcarusKey
-        [(1,73),(5,69),(10,65),(20,57),(50,29)]
+        [(1,73),(5,68),(10,62),(20,50),(50,16)]
 
 feeCalculationSpec :: Spec
 feeCalculationSpec = describe "fee calculations" $ do
@@ -1090,12 +1165,17 @@ instance Arbitrary Coin where
     shrink = shrinkCoinPositive
 
 instance Arbitrary TxOut where
-    arbitrary = TxOut addr <$> scale (`mod` 4) genTokenBundleSmallRange
+    arbitrary =
+        TxOut addr . fromCardanoValue <$> scale (`mod` 4) genValueForTxOut
       where
         addr = Address $ BS.pack (1:replicate 56 0)
+    shrink (TxOut addr bundle) =
+        [ TxOut addr bundle'
+        | bundle' <- shrinkTokenBundleSmallRange bundle
+        ]
 
 instance Arbitrary TokenBundle where
-    arbitrary = genTokenBundleSmallRange
+    arbitrary = fromCardanoValue <$> scale (`mod` 4) genValueForTxOut
     shrink = shrinkTokenBundleSmallRange
 
 instance Arbitrary TxMetadata where
@@ -1218,16 +1298,18 @@ emptyTxSkeleton = mkTxSkeleton
     emptySkeleton
 
 mockFeePolicy :: FeePolicy
-mockFeePolicy = LinearFee (Quantity 1.0) (Quantity 2.0)
+mockFeePolicy = LinearFee (Quantity 155381) (Quantity 44)
 
 mockProtocolParameters :: ProtocolParameters
 mockProtocolParameters = dummyProtocolParameters
-    { txParameters = TxParameters
+    { executionUnitPrices = Just (ExecutionUnitPrices 1 1)
+    , txParameters = TxParameters
         { getFeePolicy = mockFeePolicy
         , getTxMaxSize = Quantity 16384
         , getTokenBundleMaxSize = TokenBundleMaxSize $ TxSize 4000
         , getMaxExecutionUnits = ExecutionUnits 10000000 10000000000
         }
+    , minimumUTxOvalue = MinimumUTxOValue $ Coin 1000000
     }
 
 mockTxConstraints :: TxConstraints
@@ -1246,7 +1328,7 @@ genMockSelection = do
         oneof [ pure 0, choose (1, 1000) ]
     txOutputCount <-
         oneof [ pure 0, choose (1, 1000) ]
-    txOutputs <- replicateM txOutputCount genTxOut
+    txOutputs <- replicateM txOutputCount genOut
     txRewardWithdrawal <-
         Coin <$> oneof [ pure 0, chooseNatural (1, 1_000_000) ]
     pure MockSelection
@@ -1255,7 +1337,7 @@ genMockSelection = do
         , txRewardWithdrawal
         }
   where
-    genTxOut = TxOut (dummyAddress dummyByte) <$> genTokenBundleSmallRange
+    genOut = TxOut (dummyAddress dummyByte) <$> genTokenBundleSmallRange
       where
         dummyByte :: Word8
         dummyByte = fromIntegral $ fromEnum 'A'
@@ -1320,7 +1402,7 @@ prop_txConstraints_txCost mock =
         {txInputCount, txOutputs, txRewardWithdrawal}
     -- We allow a small amount of overestimation due to the slight variation in
     -- the marginal cost of an input:
-    upperBound = lowerBound <> txInputCount `mtimesDefault` Coin 8
+    upperBound = lowerBound <> txInputCount `mtimesDefault` Coin (4*44)
 
 -- Tests that using 'txConstraints' to estimate the size of a non-empty
 -- selection produces a result that is consistent with the result of using
@@ -1438,6 +1520,389 @@ instance Arbitrary KeyHash where
         cred <- oneof [pure Payment, pure Delegation]
         KeyHash cred . BS.pack <$> vectorOf 28 arbitrary
 
+-- https://mail.haskell.org/pipermail/haskell-cafe/2016-August/124742.html
+mkGen :: (QCGen -> a) -> Gen a
+mkGen f = MkGen $ \g _ -> f g
+
+instance MonadRandom Gen where
+    getRandom = mkGen (fst . random)
+    getRandoms = mkGen randoms
+    getRandomR range = mkGen (fst . randomR range)
+    getRandomRs range = mkGen (randomRs range)
+
+
+-- TODO: Refine type
+data Wallet' = Wallet' UTxOIndex (Wallet (SeqState 'Mainnet ShelleyKey)) (Set Tx)
+
+instance Show Wallet' where
+    show (Wallet' u w pending) = fmt $ mconcat
+        [ nameF "Wallet" (pretty w)
+        , nameF "UTxOIndex" (""+||u||+"")
+        , nameF "pending" (""+||pending||+"")
+        ]
+
+instance Arbitrary Wallet' where
+    arbitrary = do
+        utxoIndex <- scale (*2) genUTxOIndex
+        mw <- SomeMnemonic <$> genMnemonic @12
+        let s = mkSeqStateFromRootXPrv (rootK mw) purposeCIP1852 defaultAddressPoolGap
+
+        return $ Wallet'
+            utxoIndex
+            (unsafeInitWallet (UTxOIndex.toUTxO utxoIndex) (header block0) s)
+            mempty
+      where
+        rootK :: SomeMnemonic -> (ShelleyKey 'RootK XPrv, Passphrase "encryption")
+        rootK mw =
+            let
+                pwd = mempty
+            in
+                (generateKeyFromSeed (mw, Nothing) pwd, pwd)
+    shrink w = [setUTxO u' w
+               | u' <- shrinkUTxO' (getUTxO w)
+               ]
+
+      where
+        setUTxO :: UTxO -> Wallet' -> Wallet'
+        setUTxO u (Wallet' _ wal pending) =
+            Wallet'
+                (UTxOIndex.fromUTxO u)
+                (wal { utxo = u})
+                pending
+
+        getUTxO (Wallet' u _ _) = UTxOIndex.toUTxO u
+
+        shrinkUTxO' u
+            | UTxO.size u > 1 && simplifyUTxO u /= u
+                = [simplifyUTxO u]
+            | otherwise
+                = []
+          where
+            -- NOTE: We could merge all TokenBundles into one, or use
+            -- 'shrinkUTxO', however this primitive shrinking to a 10 ada UTxO
+            -- seems better.
+            simplifyUTxO :: UTxO -> UTxO
+            simplifyUTxO = UTxO . uncurry Map.singleton
+                . foldl1 (\(i, TxOut addr _val1) (_, TxOut _ _val2)
+                    -> (i, TxOut addr (TokenBundle.fromCoin (Coin 10_000_000))))
+                . UTxO.toList
+
+balanceTransactionSpec :: Spec
+balanceTransactionSpec = do
+    describe "balanceTransaction" $
+        it "produces balanced transactions or fails"
+            $ property prop_balanceTransactionBalanced
+        -- TODO: Create a test to show that datums are passed through...
+
+newtype ShowBuildable a = ShowBuildable a
+    deriving newtype Arbitrary
+
+instance Buildable a => Show (ShowBuildable a) where
+    show (ShowBuildable x) = pretty x
+
+instance Arbitrary (Hash "Datum") where
+    arbitrary = pure $ Hash $ BS.pack $ replicate 28 0
+
+instance Arbitrary PartialTx where
+    arbitrary = do
+        let era = AlonzoEra
+        tx <- genTxForBalancing era
+        let (Cardano.Tx (Cardano.TxBody content) _) = tx
+        let inputs = Cardano.txIns content
+        resolvedInputs <- forM inputs $ \i -> do
+            o <- arbitrary
+            return (fromCardanoTxIn $ fst i, o, Nothing)
+        let redeemers = []
+        return $ PartialTx
+            (sealedTxFromCardano $ InAnyCardanoEra era tx)
+            resolvedInputs
+            redeemers
+    shrink (PartialTx tx inputs redeemers) =
+        [ PartialTx tx inputs' redeemers
+        | inputs' <- shrinkInputs inputs
+        ] ++
+        [ restrictResolution $ PartialTx
+            (sealedTxFromCardano $ InAnyCardanoEra Cardano.AlonzoEra tx')
+            inputs
+            redeemers
+        | tx' <- shrinkTx (alonzoCardanoTx tx)
+        ]
+      where
+        alonzoCardanoTx :: SealedTx -> Cardano.Tx Cardano.AlonzoEra
+        alonzoCardanoTx (cardanoTx -> InAnyCardanoEra Cardano.AlonzoEra atx) =
+            atx
+        alonzoCardanoTx _ = error "alonzoCardanoTx: todo handle other eras"
+
+        shrinkInputs (i:ins) = map (:ins) (shrink i) ++ (map (i:) $ shrinkInputs ins)
+        shrinkInputs [] = []
+
+inputUTxO :: PartialTx -> Cardano.UTxO Cardano.AlonzoEra
+inputUTxO (PartialTx _ resolvedInputs _) = Cardano.UTxO $ Map.fromList $ map convertUTxO resolvedInputs
+  where
+    convertUTxO (i, o, Nothing) = (toCardanoTxIn i, toCardanoTxOut Cardano.ShelleyBasedEraAlonzo o)
+    convertUTxO (_, _, Just _) = error "inputUTxO: todo - handle datum hash"
+
+toCardanoUTxO :: UTxO -> Cardano.UTxO Cardano.AlonzoEra
+toCardanoUTxO utxo = Cardano.UTxO $ Map.fromList $ map convertUTxO $ UTxO.toList utxo
+  where
+    convertUTxO (i, o) = (toCardanoTxIn i, toCardanoTxOut Cardano.ShelleyBasedEraAlonzo o)
+
+data Ctx = Ctx (Tracer Gen WalletWorkerLog) (TransactionLayer ShelleyKey SealedTx)
+    deriving (Generic)
+
+instance Semigroup (Cardano.UTxO era) where
+    Cardano.UTxO a <> Cardano.UTxO b = Cardano.UTxO (a <> b)
+
+withBod
+    :: SealedTx
+--    -> (forall era. IsShelleyBasedEra era => Cardano.TxBody era -> a)
+    -> (Cardano.TxBody Cardano.AlonzoEra -> a)
+    -> a
+withBod (cardanoTx -> Cardano.InAnyCardanoEra Cardano.AlonzoEra tx) f =
+    let Cardano.Tx bod _ = tx
+    in f bod
+withBod _ _ = error "withBod: other eras are not handled yet"
+
+
+shrinkTx
+    :: Cardano.Tx Cardano.AlonzoEra -> [Cardano.Tx Cardano.AlonzoEra]
+shrinkTx (Cardano.Tx bod wits) =
+    [ Cardano.Tx bod' wits
+    | bod' <- shrinkTxBody bod
+    ]
+
+-- | Restricts the inputs list of the 'PartialTx' to the inputs of the
+-- underlying CBOR transaction. This allows us to "fix" the 'PartialTx' after
+-- shrinking the CBOR.
+--
+-- NOTE: Perhaps ideally 'PartialTx' would handle this automatically.
+restrictResolution :: PartialTx -> PartialTx
+restrictResolution (PartialTx tx inputs redeemers) =
+    let
+        inputs' = flip filter inputs $  \(i, _, _) ->
+            i `Set.member` inputsInTx (cardanoTx tx)
+    in
+        PartialTx tx inputs' redeemers
+  where
+    inputsInTx (InAnyCardanoEra _era (Cardano.Tx (Cardano.TxBody bod) _)) =
+        Set.fromList $ map (fromCardanoTxIn . fst) $ Cardano.txIns bod
+
+shrinkTxBody :: Cardano.TxBody Cardano.AlonzoEra -> [Cardano.TxBody Cardano.AlonzoEra]
+shrinkTxBody (Cardano.ShelleyTxBody e bod scripts scriptData aux val) = tail
+    [ Cardano.ShelleyTxBody e bod' scripts' scriptData' aux' val'
+    | bod' <- prependOriginal shrinkLedgerTxBody bod
+    , aux' <- aux : filter (/= aux) [Nothing]
+    , scriptData' <- prependOriginal shrinkScriptData scriptData
+    , scripts' <- prependOriginal shrinkScripts scripts
+    , val' <- val : filter (/= val)
+        [ Cardano.TxScriptValidity Cardano.TxScriptValiditySupportedInAlonzoEra
+            Cardano.ScriptValid
+        ]
+    ]
+  where
+    -- | For writing shrinkers in the style of https://stackoverflow.com/a/14006575
+    prependOriginal shrinker = \x -> x : shrinker x
+
+    shrinkScripts = shrinkList (const [])
+
+    shrinkScriptData Cardano.TxBodyNoScriptData = []
+    shrinkScriptData (Cardano.TxBodyScriptData era (Alonzo.TxDats dats) (Alonzo.Redeemers redeemers))
+        = tail
+          [ Cardano.TxBodyScriptData era (Alonzo.TxDats dats') (Alonzo.Redeemers redeemers')
+          | dats' <- dats : (Map.fromList <$> shrinkList (const []) (Map.toList dats))
+          , redeemers' <- redeemers : (Map.fromList <$> shrinkList (const []) (Map.toList redeemers))
+          ]
+
+    shrinkLedgerTxBody
+        :: Ledger.TxBody (Cardano.ShelleyLedgerEra Cardano.AlonzoEra)
+        -> [Ledger.TxBody (Cardano.ShelleyLedgerEra Cardano.AlonzoEra)]
+    shrinkLedgerTxBody body = tail
+        [ body
+            { Alonzo.txwdrls = wdrls' }
+            { Alonzo.outputs = outs' }
+            { Alonzo.inputs = ins' }
+            { Alonzo.txcerts = certs' }
+            { Alonzo.mint = mint' }
+            { Alonzo.reqSignerHashes = rsh' }
+            { Alonzo.txUpdates = updates' }
+        | updates' <- prependOriginal shrinkUpdates (Alonzo.txUpdates body)
+        , wdrls' <- prependOriginal shrinkWdrl (Alonzo.txwdrls body)
+        , outs' <- prependOriginal (shrinkSeq (const [])) (Alonzo.outputs body)
+        , ins' <- prependOriginal (shrinkSet (const [])) (Alonzo.inputs body)
+        , certs' <- prependOriginal  (shrinkSeq (const [])) (Alonzo.txcerts body)
+        , mint' <- prependOriginal shrinkValue (Alonzo.mint body)
+        , rsh' <- prependOriginal
+            (shrinkSet (const []))
+            (Alonzo.reqSignerHashes body)
+        ]
+
+
+    shrinkValue v = filter (/= v) [v0]
+      where
+        v0 = mempty
+
+    shrinkSet :: Ord a => (a -> [a]) -> Set a -> [Set a]
+    shrinkSet shrinkElem = map Set.fromList . shrinkList shrinkElem . F.toList
+
+    shrinkSeq shrinkElem = map StrictSeq.fromList . shrinkList shrinkElem . F.toList
+
+    shrinkWdrl :: Wdrl era -> [Wdrl era]
+    shrinkWdrl (Wdrl m) = map (Wdrl . Map.fromList) $ shrinkList shrinkWdrl' (Map.toList m)
+      where
+        shrinkWdrl' (acc, Ledger.Coin c) =
+            [(acc, Ledger.Coin c')
+            | c' <- filter (>= 1) $ shrink c
+            ]
+
+    shrinkUpdates SNothing = []
+    shrinkUpdates (SJust _) = [SNothing]
+
+-- TODO: I believe evaluateTransactionFee relies on estimating the number of
+-- witnesses required to determine the balance. We should also have a similar
+-- test which also signs.
+--
+-- TODO: Ensure scripts are well tested
+--   - Ensure we have coverage for normal plutus contracts
+--
+-- TODO: Generate data for other eras than Alonzo
+prop_balanceTransactionBalanced
+    :: Wallet'
+    -> ShowBuildable PartialTx
+    -> Property
+prop_balanceTransactionBalanced (Wallet' utxo wal pending) (ShowBuildable partialTx)
+    = withMaxSuccess 2000 $ do
+        let combinedUTxO = inputUTxO partialTx <> toCardanoUTxO (view #utxo wal)
+        let originalBalance = txBalance (sealedTx partialTx) combinedUTxO
+        forAllShow (runExceptT $ balanceTransaction
+                (Ctx nullTracer tl)
+                (delegationAddress @'Mainnet)
+                pparams
+                dummyTimeInterpreter
+                (utxo, wal, pending)
+                partialTx) (show . Pretty) $ \case
+            Right (sealedTx ) -> do
+                label "success"
+                    $ classify (originalBalance == Cardano.Lovelace 0)
+                        "already balanced"
+                    $ classify (txFee sealedTx > Cardano.Lovelace 1_000_000)
+                        "fee above 1 ada"
+                    (txBalance sealedTx combinedUTxO === 0)
+                    .&&. (abs (txFee sealedTx) .<= 4_000_000)
+                    -- Fee limit chosen at a hunch for the sake of sanity. As
+                    -- long as the property uses mainnet PParams, this is
+                    -- useful.
+            Left
+                (ErrBalanceTxSelectAssets
+                (ErrSelectAssetsSelectionError
+                (SelectionBalanceError (Balance.BalanceInsufficient err)))) -> do
+                let missing = Balance.balanceMissing err
+                case (view #coin missing == Coin 0, view #tokens missing == mempty) of
+                    (False, False) -> label "missing coin and tokens" $ property True
+                    (False, True) -> label "missing coin" $ property True
+                    (True, False) -> label "missing tokens" $ property True
+                    (True, True) -> property False
+            Left (ErrBalanceTxUpdateError (ErrExistingKeyWitnesses _)) ->
+                label "existing key wits" $ property True
+            Left
+                (ErrBalanceTxSelectAssets
+                (ErrSelectAssetsSelectionError
+                (SelectionBalanceError
+                (Balance.InsufficientMinCoinValues _)))) ->
+                label "outputs below minCoinValue" $ property True
+            Left (ErrBalanceTxNotYetSupported Deposits) ->
+                label ("not yet supported: deposits") True
+            Left (ErrBalanceTxNotYetSupported ExistingCollateral) ->
+                label "existing collateral" True
+            Left (ErrBalanceTxNotYetSupported (UnderestimatedFee _)) ->
+                label "underestimated fee" $ property True
+            Left (ErrBalanceTxNotYetSupported ZeroAdaOutput) ->
+                label "not yet supported: zero ada output" $ property True
+            Left (ErrBalanceTxNotYetSupported ConflictingNetworks) ->
+                label "not yet supported: conflicting networks" $ property True
+            Left
+                (ErrBalanceTxSelectAssets
+                (ErrSelectAssetsSelectionError
+                (SelectionBalanceError EmptyUTxO))) ->
+                label "empty UTxO" $ property True
+            Left
+                (ErrBalanceTxSelectAssets
+                (ErrSelectAssetsSelectionError
+                (SelectionBalanceError
+                (SelectionLimitReached _)))) ->
+                label "selection limit reached" $ property True
+            Left
+                (ErrBalanceTxSelectAssets
+                (ErrSelectAssetsSelectionError
+                (SelectionBalanceError (Balance.UnableToConstructChange _)))) ->
+                label "unable to construct change" $ property True
+            Left err -> label "other error" $
+                counterexample ("balanceTransaction failed: " <> show err) False
+  where
+    a .<= b = counterexample (show a <> " /<= " <> show b) $ property $ a <= b
+    tl = testTxLayer
+    pparams = (mockProtocolParameters, nodePParams)
+
+    txFee :: SealedTx -> Cardano.Lovelace
+    txFee tx = withBod tx $ \(Cardano.TxBody content) ->
+                case Cardano.txFee content of
+                        Cardano.TxFeeExplicit _ c -> c
+                        Cardano.TxFeeImplicit _ -> error "implicit fee"
+
+    txBalance :: SealedTx -> Cardano.UTxO Cardano.AlonzoEra -> Cardano.Lovelace
+    txBalance tx u = withBod tx $ \bod ->
+        lovelaceFromCardanoTxOutValue
+        $ Cardano.evaluateTransactionBalance nodePParams mempty u bod
+
+    lovelaceFromCardanoTxOutValue
+        :: forall era. Cardano.TxOutValue era -> Cardano.Lovelace
+    lovelaceFromCardanoTxOutValue (TxOutAdaOnly _ coin) = coin
+    lovelaceFromCardanoTxOutValue (TxOutValue _ val) = selectLovelace val
+
+    -- TODO:
+    nodePParams = Cardano.ProtocolParameters
+        { Cardano.protocolParamTxFeeFixed = 155381
+        , Cardano.protocolParamTxFeePerByte = 44
+        , Cardano.protocolParamMaxTxSize = 16384
+        , Cardano.protocolParamMinUTxOValue = Nothing
+        , Cardano.protocolParamMaxTxExUnits =
+            Just $ Cardano.ExecutionUnits 10000000 10000000000
+        , Cardano.protocolParamMaxValueSize = Just 4000
+        , Cardano.protocolParamProtocolVersion = (6, 0)
+        , Cardano.protocolParamDecentralization = 0
+        , Cardano.protocolParamExtraPraosEntropy = Nothing
+        , Cardano.protocolParamMaxBlockHeaderSize = 100000 -- Dummy value
+        , Cardano.protocolParamMaxBlockBodySize = 100000
+        , Cardano.protocolParamStakeAddressDeposit = Cardano.Lovelace 2_000_000
+        , Cardano.protocolParamStakePoolDeposit = Cardano.Lovelace 500_000_000
+        , Cardano.protocolParamMinPoolCost = Cardano.Lovelace 32_000_000
+        , Cardano.protocolParamPoolRetireMaxEpoch = Cardano.EpochNo 2
+        , Cardano.protocolParamStakePoolTargetNum = 100
+        , Cardano.protocolParamPoolPledgeInfluence = 0
+        , Cardano.protocolParamMonetaryExpansion = 0
+        , Cardano.protocolParamTreasuryCut  = 0
+        , Cardano.protocolParamUTxOCostPerWord = Just 34482
+        , Cardano.protocolParamCostModels = Map.empty -- TODO
+        , Cardano.protocolParamPrices =
+            Just $ Cardano.ExecutionUnitPrices 1 1
+        , Cardano.protocolParamMaxBlockExUnits =
+            Just $ Cardano.ExecutionUnits 10000000 10000000000
+        , Cardano.protocolParamCollateralPercent = Just 1
+        , Cardano.protocolParamMaxCollateralInputs = Just 3
+        }
+
+
+block0 :: Block
+block0 = Block
+    { header = BlockHeader
+        { slotNo = SlotNo 0
+        , blockHeight = Quantity 0
+        , headerHash = mockHash $ SlotNo 0
+        , parentHeaderHash = Hash ""
+        }
+    , transactions = []
+    , delegations = []
+    }
+
 updateSealedTxSpec :: Spec
 updateSealedTxSpec = do
     describe "updateSealedTx" $ do
@@ -1553,3 +2018,26 @@ readTestTransactions = runIO $ do
     listDirectory dir
         >>= traverse (\f -> (f,) <$> BS.readFile (dir </> f))
         >>= traverse (\(f,bs) -> (f,) <$> unsafeSealedTxFromHex bs)
+
+dummyTimeInterpreter :: Monad m => TimeInterpreter m
+dummyTimeInterpreter = hoistTimeInterpreter (pure . runIdentity)
+    $ mkSingleEraInterpreter
+        (getGenesisBlockDate dummyGenesisParameters)
+        dummySlottingParameters
+
+dummySlottingParameters :: SlottingParameters
+dummySlottingParameters = SlottingParameters
+    { getSlotLength = SlotLength 1
+    , getEpochLength = EpochLength 21600
+    , getActiveSlotCoefficient = ActiveSlotCoefficient 1
+    , getSecurityParameter = Quantity 2160
+    }
+
+dummyGenesisParameters :: GenesisParameters
+dummyGenesisParameters = GenesisParameters
+    { getGenesisBlockHash = genesisHash
+    , getGenesisBlockDate = StartTime $ posixSecondsToUTCTime 0
+    }
+
+genesisHash :: Hash "Genesis"
+genesisHash = Hash (B8.replicate 32 '0')
