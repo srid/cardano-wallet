@@ -564,6 +564,8 @@ import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Vector as V
+import Text.Pretty.Simple
+    ( pShow )
 
 -- $Development
 -- __Naming Conventions__
@@ -1436,6 +1438,19 @@ data PartialTx = PartialTx
     , inputs :: [(TxIn, TxOut, Maybe (Hash "Datum"))]
     , redeemers :: [Redeemer]
     } deriving (Show, Generic, Eq)
+
+instance Buildable PartialTx where
+    build (PartialTx tx ins redeemers) = nameF "PartialTx" $ mconcat
+        [ nameF "inputs" (listF' inF ins)
+        , nameF "redeemers" (pretty redeemers)
+        , nameF "tx" (cardanoTxF (cardanoTx tx))
+        ]
+      where
+        inF :: (TxIn, TxOut, Maybe (Hash "Datum")) -> Builder
+        inF (i,o,d) = ""+|i|+" "+|o|+" "+|d|+""
+
+        cardanoTxF :: Cardano.InAnyCardanoEra Cardano.Tx -> Builder
+        cardanoTxF (Cardano.InAnyCardanoEra _ tx) = pretty $ pShow tx
 
 balanceTransaction
     :: forall m s k ctx.
