@@ -52,6 +52,8 @@ module Cardano.Wallet.Primitive.Types
     , getPoolRegistrationCertificate
     , getPoolRetirementCertificate
 
+    , NonWalletCertificate (..)
+
     -- * Network Parameters
     , NetworkParameters (..)
     , GenesisParameters (..)
@@ -1423,6 +1425,13 @@ instance Buildable PoolRetirementCertificate where
         <> build p
         <> " with retirement epoch "
         <> build e
+
+data NonWalletCertificate
+    = GenesisCertificate
+    | MIRCertificate
+    deriving (Generic, Show, Read, Eq)
+
+instance NFData NonWalletCertificate
 
 -- | Represents an abstract notion of a certificate publication time.
 --
