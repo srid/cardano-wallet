@@ -9,6 +9,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TupleSections #-}
@@ -26,7 +27,7 @@ module Cardano.Wallet.Shelley.TransactionSpec
 import Prelude
 
 import Cardano.Address.Derivation
-    ( XPrv, xprvFromBytes, xprvToBytes )
+    ( XPrv, XPub, toXPub, xprvFromBytes, xprvToBytes, xpubPublicKey )
 import Cardano.Address.Script
     ( KeyHash (..)
     , KeyRole (Delegation, Payment)
@@ -44,23 +45,34 @@ import Cardano.Api
     , ShelleyBasedEra (..)
     , cardanoEraStyle
     )
+import Cardano.Api.Gen
+    ( genTx, genTxBodyContent, genWitnesses )
+import Cardano.Mnemonic
+    ( SomeMnemonic (..) )
 import Cardano.Wallet
     ( ErrSelectAssets (..)
     , ErrUpdateSealedTx (..)
     , FeeEstimation (..)
     , estimateFee
+    , signTransaction
     )
 import Cardano.Wallet.Byron.Compatibility
     ( maryTokenBundleMaxSize )
 import Cardano.Wallet.Gen
     ( genScript )
+import Cardano.Wallet.Gen
+    ( genMnemonic )
 import Cardano.Wallet.Primitive.AddressDerivation
-    ( DerivationIndex (..)
+    ( Depth (..)
+    , DerivationIndex (..)
     , Passphrase (..)
     , PassphraseMaxLength (..)
     , PassphraseMinLength (..)
     , PassphraseScheme (..)
+    , deriveRewardAccount
+    , getRawKey
     , hex
+    , liftRawKey
     , preparePassphrase
     )
 import Cardano.Wallet.Primitive.AddressDerivation.Byron
@@ -111,8 +123,10 @@ import Cardano.Wallet.Primitive.Types.Tx
     , TxOut (..)
     , TxSize (..)
     , cardanoTx
+    , getSealedTxWitnesses
     , sealedTxFromBytes
     , sealedTxFromBytes'
+    , sealedTxFromCardano
     , sealedTxFromCardano'
     , serialisedTx
     , txMetadataIsNull
@@ -153,10 +167,14 @@ import Cardano.Wallet.Transaction
     )
 import Cardano.Wallet.Unsafe
     ( unsafeFromHex )
+import Control.Arrow
+    ( first )
 import Control.Monad
     ( forM_, replicateM )
 import Control.Monad.Trans.Except
     ( except, runExceptT )
+import Crypto.Hash.Utils
+    ( blake2b224 )
 import Data.ByteString
     ( ByteString )
 import Data.Either
@@ -210,6 +228,7 @@ import Test.Hspec.QuickCheck
 import Test.QuickCheck
     ( Arbitrary (..)
     , Blind (..)
+    , InfiniteList (..)
     , NonEmptyList (..)
     , Property
     , arbitraryPrintableChar
@@ -220,7 +239,10 @@ import Test.QuickCheck
     , counterexample
     , cover
     , elements
+    , forAll
+    , forAllShow
     , frequency
+    , label
     , oneof
     , property
     , scale
@@ -245,7 +267,11 @@ import Test.Utils.Pretty
 
 import qualified Cardano.Api as Cardano
 import qualified Cardano.Api.Shelley as Cardano
+import qualified Cardano.Crypto.Hash.Blake2b as Blake2b
+import qualified Cardano.Crypto.Hash.Class as Crypto
 import qualified Cardano.Ledger.Alonzo.TxWitness as Alonzo
+import qualified Cardano.Ledger.Crypto as Crypto
+import qualified Cardano.Wallet.Primitive.AddressDerivation.Shelley as Shelley
 import qualified Cardano.Wallet.Primitive.CoinSelection.Balance as Balance
 import qualified Cardano.Wallet.Primitive.Types.TokenBundle as TokenBundle
 import qualified Cardano.Wallet.Primitive.Types.TokenMap as TokenMap
@@ -258,6 +284,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Shelley.Spec.Ledger.API as SL
 
 spec :: Spec
 spec = do
@@ -268,6 +295,131 @@ spec = do
     forAllEras binaryCalculationsSpec
     transactionConstraintsSpec
     updateSealedTxSpec
+    describe "Sign transaction" $ do
+        it "signTransaction adds reward account witness when necessary" $
+            property prop_signTransaction_addsRewardAccountKey
+
+instance Arbitrary SealedTx where
+    arbitrary = sealedTxFromCardano <$> genTx
+
+showTransactionBody
+    :: forall era
+     . IsCardanoEra era
+    => Cardano.TxBodyContent Cardano.BuildTx era
+    -> String
+showTransactionBody =
+    either Cardano.displayError show . Cardano.makeTransactionBody
+
+unsafeMakeTransactionBody
+    :: forall era
+     . IsCardanoEra era
+    => Cardano.TxBodyContent Cardano.BuildTx era
+    -> Cardano.TxBody era
+unsafeMakeTransactionBody =
+    either (error . Cardano.displayError) id . Cardano.makeTransactionBody
+
+stakeAddressForKey
+    :: SL.Network
+    -> XPub
+    -> Cardano.StakeAddress
+stakeAddressForKey net pubkey =
+    Cardano.StakeAddress
+        net
+        (SL.KeyHashObj (SL.KeyHash $ hash pubkey)
+             :: SL.Credential 'SL.Staking Crypto.StandardCrypto)
+    where
+        hash :: XPub -> Crypto.Hash Blake2b.Blake2b_224 a
+        hash = fromJust . Crypto.hashFromBytes . blake2b224 . xpubPublicKey
+
+withdrawalForKey
+    :: SL.Network
+    -> XPub
+    -> Cardano.Lovelace
+    -> (Cardano.StakeAddress, Cardano.Lovelace, Cardano.BuildTxWith Cardano.BuildTx (Cardano.Witness Cardano.WitCtxStake era))
+withdrawalForKey net pubkey wdrlAmt =
+    ( stakeAddressForKey net pubkey
+    , wdrlAmt
+    , Cardano.BuildTxWith $ Cardano.KeyWitness Cardano.KeyWitnessForStakeAddr
+    )
+
+prop_signTransaction_addsRewardAccountKey
+    :: UTxO
+    -> (XPrv, Passphrase "encryption")
+    -> AnyCardanoEra
+    -> Coin
+    -> Property
+prop_signTransaction_addsRewardAccountKey utxo k (AnyCardanoEra era) wdrlAmt =
+    case cardanoEraStyle era of
+        LegacyByronEra -> label "withdrawals not supported in Byron era" True
+        ShelleyBasedEra era' -> do
+            let shelleyEra = Cardano.shelleyBasedToCardanoEra era'
+
+            forAllShow (genTxBodyContent shelleyEra) showTransactionBody $ \txBodyContent -> do
+                let txBody = unsafeMakeTransactionBody txBodyContent
+                forAll (genWitnesses shelleyEra txBody) $ \wits -> do
+
+                    let
+                        rootK :: (ShelleyKey 'RootK XPrv, Passphrase "encryption")
+                        rootK = first liftRawKey k
+
+                        rawRewardK :: (XPrv, Passphrase "encryption")
+                        rawRewardK = (getRawKey $ deriveRewardAccount (snd rootK) (fst rootK), snd rootK)
+
+                        rewardAcctPubKey :: XPub
+                        rewardAcctPubKey = toXPub $ fst rawRewardK
+
+                        extraWdrls = [ withdrawalForKey SL.Mainnet rewardAcctPubKey (toCardanoLovelace wdrlAmt) ]
+
+                    case Cardano.withdrawalsSupportedInEra shelleyEra of
+                        Nothing ->
+                            error "Withdrawals should be supported in all Shelley eras"
+                        Just supported ->
+                            let
+                                txBodyContent' = txBodyContent {
+                                              Cardano.txWithdrawals =
+                                                      case Cardano.txWithdrawals txBodyContent of
+                                                          Cardano.TxWithdrawalsNone ->
+                                                              Cardano.TxWithdrawals supported extraWdrls
+                                                          Cardano.TxWithdrawals _ wdrls ->
+                                                              Cardano.TxWithdrawals supported $ wdrls <> extraWdrls
+                                              }
+                                txBody' = unsafeMakeTransactionBody txBodyContent'
+
+                                sealedTx = sealedTxFromCardano' $ Cardano.Tx txBody' wits
+                                sealedTx' = signTransaction tl (AnyCardanoEra shelleyEra) (const Nothing) rootK utxo sealedTx
+
+                                expectedWit = mkShelleyWitness txBody' rawRewardK
+                            in
+                                conjoin [ InAnyCardanoEra era expectedWit `elem` getSealedTxWitnesses sealedTx'
+                                          & counterexample ("actual witnesses: " <> show (getSealedTxWitnesses sealedTx'))
+                                          & counterexample ("expected witness: " <> show expectedWit)
+                                        , length (getSealedTxWitnesses sealedTx') > length (getSealedTxWitnesses sealedTx)
+                                          & counterexample ("expected signTransaction to not remove witnesses")
+                                          & counterexample ("witnesses after: " <> show (getSealedTxWitnesses sealedTx'))
+                                          & counterexample ("witnesses before: " <> show (getSealedTxWitnesses sealedTx))
+                                        ]
+
+
+    where
+        tl = testTxLayer
+
+instance Arbitrary (ShelleyKey 'RootK XPrv) where
+    shrink _ = []
+    arbitrary = genRootKeysSeqWithPass =<< genPassphrase (0, 16)
+
+genRootKeysSeqWithPass
+    :: Passphrase "encryption"
+    -> Gen (ShelleyKey depth XPrv)
+genRootKeysSeqWithPass encryptionPass = do
+    s <- SomeMnemonic <$> genMnemonic @15
+    g <- Just . SomeMnemonic <$> genMnemonic @12
+    return $ Shelley.unsafeGenerateKeyFromSeed (s, g) encryptionPass
+
+genPassphrase :: (Int, Int) -> Gen (Passphrase purpose)
+genPassphrase range = do
+    n <- choose range
+    InfiniteList bytes _ <- arbitrary
+    return $ Passphrase $ BA.convert $ BS.pack $ take n bytes
 
 forAllEras :: (AnyCardanoEra -> Spec) -> Spec
 forAllEras eraSpec = do
