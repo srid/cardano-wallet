@@ -524,7 +524,6 @@ import Fmt
     , blockListF
     , blockMapF
     , build
-    , fmt
     , listF'
     , nameF
     , pretty
@@ -1455,7 +1454,7 @@ instance Buildable PartialTx where
         inF (i,o,d) = ""+|i|+" "+|o|+" "+|d|+""
 
         cardanoTxF :: Cardano.InAnyCardanoEra Cardano.Tx -> Builder
-        cardanoTxF (Cardano.InAnyCardanoEra _ tx) = pretty $ pShow tx
+        cardanoTxF (Cardano.InAnyCardanoEra _ tx') = pretty $ pShow tx'
 
 balanceTransaction
     :: forall m s k ctx.
