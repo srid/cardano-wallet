@@ -15,6 +15,7 @@ module Cardano.Wallet.Gen
     , genLegacyAddress
     , genBlockHeader
     , genChainPoint
+    , genSlotPoint
     , genActiveSlotCoefficient
     , shrinkActiveSlotCoefficient
     , genSlotNo
@@ -54,6 +55,8 @@ import Cardano.Wallet.Primitive.Types
     , ChainPoint (..)
     , ProtocolMagic (..)
     , SlotNo (..)
+    , SlotPoint
+    , WithOrigin (..)
     )
 import Cardano.Wallet.Primitive.Types.Address
     ( Address (..) )
@@ -177,6 +180,12 @@ genChainPoint = frequency
     ]
   where
     toChainPoint (BlockHeader slot _ h _) = ChainPoint slot h
+
+genSlotPoint :: Gen SlotPoint
+genSlotPoint = frequency
+    [ ( 1, pure Origin)
+    , (40, At <$> genSlotNo)
+    ]
 
 genBlockHeader :: SlotNo -> Gen BlockHeader
 genBlockHeader sl = do

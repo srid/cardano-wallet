@@ -96,6 +96,7 @@ import Cardano.Wallet.Primitive.Types
     , Range (..)
     , SlotInEpoch (..)
     , SlotNo (..)
+    , SlotPoint
     , SortOrder (..)
     , TxParameters (..)
     , WalletDelegation (..)
@@ -104,6 +105,7 @@ import Cardano.Wallet.Primitive.Types
     , WalletMetadata (..)
     , WalletName (..)
     , WalletPassphraseInfo (..)
+    , WithOrigin (..)
     , rangeIsValid
     , unsafeEpochNo
     , wholeRange
@@ -364,6 +366,14 @@ instance Arbitrary SlotNo where
         EpochNo ep <- arbitrary
         pure $ SlotNo $ fromIntegral $ fromIntegral ep * arbitraryChainLength + sl
     shrink = shrinkSlotNo
+
+instance Arbitrary SlotPoint where
+    arbitrary = frequency
+        [ ( 1, pure Origin)
+        , (40, At <$> arbitrary)
+        ]
+    shrink Origin = [Origin]
+    shrink (At slot) = At <$> shrinkSlotNo slot
 
 instance Arbitrary SlotInEpoch where
     shrink (SlotInEpoch x) = SlotInEpoch <$> shrink x
