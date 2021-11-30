@@ -105,7 +105,7 @@ import Data.Maybe
 import Data.Ratio
     ( denominator, numerator )
 import Data.Word
-    ( Word16, Word32 )
+    ( Word32 )
 import Numeric.Natural
     ( Natural )
 import Shelley.Spec.Ledger.API
@@ -195,8 +195,6 @@ spec =
                 property genAssetNameCoverage
             it "genAlphaNum" $
                 property genAlphaNumCoverage
-            it "genAssetId" $
-                property genAssetIdCoverage
             it "genValueForMinting" $
                 property
                 $ forAll genValueForMinting genValueForMintingCoverage
@@ -294,7 +292,8 @@ spec =
                 forAllEras $ \(AnyCardanoEra era) ->
                     it (show era) $
                         property
-                        $ forAll (genWitnesses era)
+                        $ forAll (genTxBody era)
+                        $ \body -> forAll (genWitnesses era body)
                         $ genWitnessesCoverage era
             -- describe "genTxBodyContent" $ do
             --     it "ByronEra" $
@@ -433,7 +432,7 @@ instance Arbitrary SlotNo where
     arbitrary = genSlotNo
 
 genLovelaceCoverage :: Lovelace -> Property
-genLovelaceCoverage = unsignedCoverage (maxBound @Word16) "lovelace"
+genLovelaceCoverage = unsignedCoverage (maxBound @Word32) "lovelace"
 
 instance Arbitrary Lovelace where
     arbitrary = genLovelace
@@ -682,7 +681,7 @@ genAssetNameCoverage :: AssetName -> Property
 genAssetNameCoverage n = checkCoverage
     $ cover 1 (assetNameLen == 0)
         "asset name is empty"
-    $ cover 10 (assetNameLen == shortLength)
+    $ cover 0.1 (assetNameLen == shortLength)
         "asset name is short"
     $ cover 5 (assetNameLen == longLength)
         "asset name is long"
@@ -710,23 +709,6 @@ genAlphaNumCoverage = forAll genAlphaNum $ \c ->
         "character is lower-case alphabetic"
     $ label "character is alphabetic or numeric" (isAlphaNum c)
       & counterexample "character wasn't alphabetic or numeric"
-
-genAssetIdCoverage :: AssetId -> Property
-genAssetIdCoverage assetId = checkCoverage
-    $ cover 10 (isAdaAssetId assetId)
-        "ADA asset id"
-    $ cover 10 (isNonAdaAssetId assetId)
-        "non-ADA asset id"
-        True
-
-    where
-        isAdaAssetId = (== AdaAssetId)
-
-        isNonAdaAssetId AdaAssetId    = False
-        isNonAdaAssetId (AssetId _ _) = True
-
-instance Arbitrary AssetId where
-    arbitrary = genAssetId
 
 genValueForMintingCoverage :: Value -> Property
 genValueForMintingCoverage val = checkCoverage
@@ -791,7 +773,7 @@ genNetworkIdCoverage :: NetworkId -> Property
 genNetworkIdCoverage n = checkCoverage
     $ cover 10 (isMainnet n)
         "network is mainnet"
-    $ cover 10 (isTestnet n)
+    $ cover 1 (isTestnet n)
         "network is testnet"
         True
     where
@@ -999,11 +981,11 @@ genTxAuxScriptsCoverage era aux =
 genTxMetadataValueCoverage :: TxMetadataValue -> Property
 genTxMetadataValueCoverage meta =
     checkCoverage
-        $ cover 10 (isMetaNumber meta) "is TxMetaNumber"
-        $ cover 10 (isMetaBytes meta) "is TxMetaBytes"
-        $ cover 10 (isMetaText meta) "is TxMetaText"
-        $ cover 10 (isMetaList meta) "is TxMetaList"
-        $ cover 10 (isMetaMap meta) "is TxMetaMap" True
+        $ cover 8 (isMetaNumber meta) "is TxMetaNumber"
+        $ cover 8 (isMetaBytes meta) "is TxMetaBytes"
+        $ cover 8 (isMetaText meta) "is TxMetaText"
+        $ cover 8 (isMetaList meta) "is TxMetaList"
+        $ cover 8 (isMetaMap meta) "is TxMetaMap" True
 
     where
         isMetaNumber = \case
@@ -1045,7 +1027,7 @@ genTxMetadataCoverage (TxMetadata meta) =
 
     where
         metaNumberCoverage n = checkCoverage
-            $ cover 1 (n == 0)
+            $ cover 0.1 (n == 0)
               "meta index == 0"
             $ cover 10 (n > 0)
               "meta index > 0"
@@ -1165,7 +1147,7 @@ genAddressInEraCoverage era addr =
 
 genUnsignedQuantityCoverage :: Quantity -> Property
 genUnsignedQuantityCoverage =
-    unsignedCoverage (maxBound @Word16) "unsigned quantity"
+    unsignedCoverage (maxBound @Word32) "unsigned quantity"
 
 genValueForTxOutCoverage :: Value -> Property
 genValueForTxOutCoverage val =
@@ -1624,7 +1606,7 @@ unsignedCoverage b name x = checkCoverage
         (name <> " is zero")
     $ cover 30 (x > 0 && x < veryLarge)
         (name <> " is between zero and very large")
-    $ cover 5 (x > veryLarge)
+    $ cover 1 (x > veryLarge)
         (name <> " is greater than very large")
     $ label (name <> " is non-negative") (x >= 0)
       & counterexample (name <> " was negative")
