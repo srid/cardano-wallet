@@ -1439,7 +1439,7 @@ instance ToText NonWalletCertificate where
 instance FromText NonWalletCertificate where
     fromText "genesis" = Right GenesisCertificate
     fromText "mir" = Right MIRCertificate
-    fromText _ = Left $ TextDecodingError $
+    fromText _ = Left $ TextDecodingError
         "expecting either 'genesis' or 'mir' for NonWalletCertificate text value"
 
 instance NFData NonWalletCertificate
